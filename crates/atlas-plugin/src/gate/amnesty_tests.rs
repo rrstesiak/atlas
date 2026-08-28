@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The one-time PR #701 amnesty must excuse exactly the pinned bytes,
+//! The one-time PR #648 amnesty must excuse exactly the pinned bytes,
 //! fail closed on everything else, and demand its own removal.
 //!
-//! `the_table_is_exactly_the_pr_701_grant` is deliberately red while the
+//! `the_table_is_exactly_the_pr_648_grant` is deliberately red while the
 //! table holds `"PENDING"` OIDs: the pin phase (compute the landed blob OIDs
 //! with `git hash-object` once content is final) is what turns it green, so
 //! the grant cannot ship half-armed by accident.
 
-use super::amnesty::{AMNESTY_EPOCH, AmnestyEntry, ONE_TIME_AMNESTY, excused, excused_by};
-use super::check::invalidating_paths;
+use super::amnesty::{AMNESTY_EPOCH, AmnestyEntry, ONE_TIME_AMNESTY, excused_by};
+use super::check::invalidating_paths_with_amnesty;
 use super::coverage_tests::{any_gate, scratch_repo};
 use super::tests::tempdir;
 use super::{REQUIRED_GATES, read_record, records_newest_first};
@@ -76,7 +76,7 @@ fn an_unlisted_path_is_never_excused() {
     let root = dir.path();
     scratch_repo::init(root);
     scratch_repo::commit(root, TAXONOMY, "{}", "taxonomy");
-    scratch_repo::commit(root, "crates/engine.rs", "// code", "engine");
+    scratch_repo::commit(root, "crates/engine.rs", "{}", "engine");
     let head = scratch_repo::head(root);
     // The table pins engine.rs's own real OID under the TAXONOMY path name,
     // so even a colliding-content probe cannot sneak an unlisted path in.
@@ -113,13 +113,9 @@ fn git_failure_fails_closed() {
     );
 }
 
-/// ★ The wiring, not just the table: `check.rs::invalidating_paths` really
-/// consults the grant. Content matching no pin must survive the filter and
-/// invalidate; the real repo's coverage bytes, the content the live
-/// table can possibly pin — must be dropped from the list exactly when
-/// [`excused`] says they are the grant. While the pin is live this exercises
-/// the excuse arm; after any later coverage edit both sides of the
-/// equivalence flip together and it keeps proving the keep arm.
+/// ★ The wiring, not just the table: the invalidating-path filter really
+/// consults the grant. An explicit test table keeps both arms executable after
+/// the one-time production table has been emptied.
 #[test]
 fn invalidating_paths_drops_exactly_what_the_grant_excuses() {
     let dir = tempdir::Dir::new();
@@ -128,52 +124,44 @@ fn invalidating_paths_drops_exactly_what_the_grant_excuses() {
     scratch_repo::commit(root, GRANTED_COVERAGE, "// baseline", "baseline");
     let record_sha = scratch_repo::head(root);
 
-    scratch_repo::commit(root, GRANTED_COVERAGE, "// not the grant", "hostile edit");
-    let hostile = scratch_repo::head(root);
-    let kept = invalidating_paths(root, &hostile, &record_sha, &any_gate())
-        .expect("the diff runs in a scratch repo");
-    assert!(
-        kept.iter().any(|p| p == GRANTED_COVERAGE),
-        "content matching no pin must keep invalidating, got {kept:?}"
-    );
+    scratch_repo::commit(root, GRANTED_COVERAGE, "// granted bytes", "the grant");
+    let granted = scratch_repo::head(root);
+    let table = [entry(
+        GRANTED_COVERAGE,
+        blob_oid(root, &granted, GRANTED_COVERAGE),
+    )];
+    let dropped = invalidating_paths_with_amnesty(root, &granted, &record_sha, &any_gate(), &table)
+        .expect("the granted diff runs");
+    assert_eq!(dropped, Vec::<String>::new());
 
-    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("repo root is two levels above the crate");
-    let real =
-        std::fs::read_to_string(repo.join(GRANTED_COVERAGE)).expect("the real coverage map reads");
-    scratch_repo::commit(root, GRANTED_COVERAGE, &real, "the amnestied landing");
-    let head = scratch_repo::head(root);
-    let after = invalidating_paths(root, &head, &record_sha, &any_gate())
-        .expect("the diff runs in a scratch repo");
+    scratch_repo::commit(root, GRANTED_COVERAGE, "// later edit", "later edit");
+    let later = scratch_repo::head(root);
+    let kept = invalidating_paths_with_amnesty(root, &later, &record_sha, &any_gate(), &table)
+        .expect("the later diff runs");
     assert_eq!(
-        !after.iter().any(|p| p == GRANTED_COVERAGE),
-        excused(root, &head, GRANTED_COVERAGE),
-        "invalidating_paths must drop the surviving path exactly when the \
-         grant excuses it; the filter and the table may never disagree"
+        kept,
+        vec![GRANTED_COVERAGE.to_string()],
+        "editing the granted path must restore invalidation"
     );
 }
 
-/// The PR #701 grant is exactly the three boundary files in that change.
+/// The PR #648 grant is exactly the one KV-budget file in that change.
 /// Placeholder OIDs keep this test red until the final-content pin commit.
+/// (The PR #701 grant — three boundary files — completed this same lifecycle:
+/// pinned, re-earned, emptied.)
 #[test]
-fn the_table_is_exactly_the_pr_701_grant() {
+fn the_table_is_exactly_the_pr_648_grant() {
     let paths: Vec<&str> = ONE_TIME_AMNESTY.iter().map(|e| e.path).collect();
-    // The grant has exactly two legal shapes: the three PR #701 boundary files,
-    // or EMPTY once `amnesty_expires_once_every_gate_has_a_fresh_record` has
-    // demanded its removal. Anything else is the grant growing, which is what
-    // this test exists to prevent. Removal is the designed end of a one-time
-    // grant, so it must not read as a violation of it.
+    // The grant has exactly two legal shapes: PR #648's single accounting-fix
+    // file, or EMPTY once `amnesty_expires_once_every_gate_has_a_fresh_record`
+    // has demanded its removal. Anything else is the grant growing, which is
+    // what this test exists to prevent. Removal is the designed end of a
+    // one-time grant, so it must not read as a violation of it.
     if !paths.is_empty() {
         assert_eq!(
             paths,
-            vec![
-                "crates/atlas-plugin/src/gate/check.rs",
-                "crates/atlas-plugin/src/gate/coverage.rs",
-                "crates/atlas-plugin/src/gate/required.rs",
-            ],
-            "the grant must not grow beyond PR #701's boundary files"
+            vec!["crates/spark-model/src/factory/build.rs"],
+            "the grant must not grow beyond PR #648's KV-budget fix"
         );
     }
     for entry in &ONE_TIME_AMNESTY {
@@ -189,7 +177,7 @@ fn the_table_is_exactly_the_pr_701_grant() {
             entry.path
         );
         assert!(
-            entry.grant.contains("PR #701"),
+            entry.grant.contains("PR #648"),
             "{} lacks its grant",
             entry.path
         );
@@ -201,11 +189,7 @@ fn the_table_is_exactly_the_pr_701_grant() {
 /// earned against the amnestied content and the table protects nothing —
 /// this fails until someone empties it.
 #[test]
-#[allow(clippy::const_is_empty)]
 fn amnesty_expires_once_every_gate_has_a_fresh_record() {
-    if ONE_TIME_AMNESTY.is_empty() {
-        return; // The grant has been removed; nothing left to expire.
-    }
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())
@@ -222,12 +206,16 @@ fn amnesty_expires_once_every_gate_has_a_fresh_record() {
             newest <= AMNESTY_EPOCH
         })
         .collect();
-    assert!(
-        !stale.is_empty(),
-        "every required gate now has a record newer than AMNESTY_EPOCH \
-         (end of 2026-08-21 UTC): the one-time grant has been fully re-earned \
-         and protects nothing. EMPTY THE TABLE in \
-         crates/atlas-plugin/src/gate/amnesty.rs — the amnesty must not \
-         outlive the records it existed to protect."
-    );
+    if ONE_TIME_AMNESTY.is_empty() {
+        assert!(
+            stale.is_empty(),
+            "the PR #648 grant was removed before every required gate had a fresh record: {stale:?}"
+        );
+    } else {
+        assert!(
+            !stale.is_empty(),
+            "every required gate now has a record newer than AMNESTY_EPOCH \
+             (end of 2026-08-27 UTC): empty the fully re-earned one-time grant"
+        );
+    }
 }
